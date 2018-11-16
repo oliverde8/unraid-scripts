@@ -1,0 +1,98 @@
+#!/usr/bin/php
+<?PHP
+#backgroundOnly=true
+#description=A script designed to monitor a USB hub or a particular USB bus for changes and then attach or detach devices to an applicable VM
+
+/*
+ * Configuration's
+ */
+$vmName = "Windows 10 2";// must be the exact name
+$pollingTime = 10;       // the interval between checks in seconds
+$startupDelay = 300;     // startup delay before monitoring for changes in seconds (set to enough time for the VM to get up and running)
+$waitBetweenPlugs = 10;  // If using a device such a KVM mounting multiple usb drives at once can cause some issues with the host. Wait in between.
+
+$ignoredDevices = [      // List of device names that should be ignored.
+	'Ours Technology, Inc. Transcend JetFlash 2.0 / Astone USB Drive / Intellegent Stick 2.0' // must be exact as listed via lsusb
+];
+
+// only use one or the other of the following lines not both  See thread for details
+#$hubName = "Texas Instruments, Inc. TUSB2046 Hub";  // must be exact as listed via lsusb
+$bus  = "003";                                       // see thread for details
+
+/**
+ * Code don't change from here on.
+ */
+ 
+function getDeviceList($bus, $ignoredDevices) {
+  exec("lsusb | grep 'Bus $bus'",$allDevicesOnBus);
+  foreach ($allDevicesOnBus as $Devices) {
+    $deviceLine = explode(" ",$Devices);
+	if (!in_array($deviceLine[5], $ignoredDevices)) {
+		$initialState[$deviceLine[5]] = $deviceLine[5];
+	} else {
+		logger("Ignoring device $Devices");
+	}
+    var_dump();
+  }
+  return $initialState;
+}  
+
+function createXML($deviceID, $waitBetweenPlugs) {
+  sleep($waitBetweenPlugs);
+  $usb = explode(":",$deviceID);
+  $usbstr .= "<hostdev mode='subsystem' type='usb'>
+                <source>
+                  <vendor id='0x".$usb[0]."'/>
+                  <product id='0x".$usb[1]."'/>
+                </source>
+              </hostdev>";
+  file_put_contents("/tmp/USBTempXML.xml",$usbstr);
+}
+
+function logger($string) {
+  echo "$string\n";
+  shell_exec("logger ".escapeshellarg($string));
+}
+              
+# Begin Main
+
+logger("Sleeping for $startupDelay before monitoring $bus for changes to passthrough to $vmName");
+sleep($startupDelay);
+
+$hubBus = $bus;
+if ( ! $hubBus ) {
+  $hub = explode(" ",exec("lsusb | grep '$hubName'"));
+  $hubBus = $hub[1];
+}
+
+logger("Monitoring $hubBus for changes");
+
+$initialState = getDeviceList($hubBus, $ignoredDevices);
+
+while (true) {
+  $unRaidVars = parse_ini_file("/var/local/emhttp/var.ini");
+  if ($unRaidVars['mdState'] != "STARTED") {
+    break;
+  }
+  $currentDevices = getDeviceList($hubBus, $ignoredDevices);
+  
+  foreach ($currentDevices as $Device) {
+    if ( ! $initialState[$Device] ) {
+      logger("$Device Added to bus $hubBus  Attaching to $vmName");
+      createXML($Device, $waitBetweenPlugs);
+      exec("/usr/sbin/virsh attach-device '$vmName' /tmp/USBTempXML.xml 2>&1");
+      $initialState[$Device] = $Device;
+    }
+  }
+  foreach ($initialState as $Device) {
+    if ( ! $currentDevices[$Device] ) {
+      logger("$Device Removed from bus $hubBus  Detaching from $vmName");
+      createXML($Device, $waitBetweenPlugs);
+      exec("/usr/sbin/virsh detach-device '$vmName' /tmp/USBTempXML.xml 2>&1");
+      unset ($initialState[$Device]);
+    }
+  }
+  sleep($pollingTime);
+}
+
+?>
